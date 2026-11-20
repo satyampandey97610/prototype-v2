@@ -1,0 +1,108 @@
+{
+  "version": 1,
+  "mode": "deterministic_offline_cache",
+  "cases": [
+    {
+      "id": "case_wellness_sunday_lotus",
+      "patient_id": "pat_010",
+      "query": "When does the wellness room open on Sunday?",
+      "expected_intent": "society_annex",
+      "expected_doc_id": "annex-lotus-tower",
+      "expected_safety_level": null
+    },
+    {
+      "id": "case_wellness_sunday_shivalik",
+      "patient_id": "pat_003",
+      "query": "When does the wellness room open on Sunday?",
+      "expected_intent": "society_annex",
+      "expected_doc_id": "annex-shivalik-greens",
+      "expected_safety_level": null
+    },
+    {
+      "id": "case_chest_pain_emergency",
+      "patient_id": "pat_001",
+      "query": "I have severe chest pain and sweating",
+      "expected_intent": "safety_escalation",
+      "expected_doc_id": "escalation-sla",
+      "expected_safety_level": 1
+    },
+    {
+      "id": "case_fasting_lipid",
+      "patient_id": "pat_004",
+      "query": "How long do I need to fast for a Lipid Profile?",
+      "expected_intent": "test_prep",
+      "expected_doc_id": "test-prep-fasting",
+      "expected_safety_level": null
+    },
+    {
+      "id": "case_plan_coverage_v2",
+      "patient_id": "pat_002",
+      "query": "What is covered under the current care plan for lab tests and specialists?",
+      "expected_intent": "plan_coverage",
+      "expected_doc_id": "plan-coverage-v2",
+      "expected_safety_level": null
+    }
+  ],
+  "last_run_results": [
+    {
+      "id": "case_wellness_sunday_lotus",
+      "patient_id": "pat_010",
+      "query": "When does the wellness room open on Sunday?",
+      "predicted_intent": "society_annex",
+      "predicted_safety_level": null,
+      "retrieved_doc_ids": [
+        "staff-notes-internal",
+        "clinic-policy",
+        "staff-notes-internal"
+      ]
+    },
+    {
+      "id": "case_wellness_sunday_shivalik",
+      "patient_id": "pat_003",
+      "query": "When does the wellness room open on Sunday?",
+      "predicted_intent": "society_annex",
+      "predicted_safety_level": null,
+      "retrieved_doc_ids": [
+        "staff-notes-internal",
+        "clinic-policy",
+        "staff-notes-internal"
+      ]
+    },
+    {
+      "id": "case_chest_pain_emergency",
+      "patient_id": "pat_001",
+      "query": "I have severe chest pain and sweating",
+      "predicted_intent": "safety_escalation",
+      "predicted_safety_level": 1,
+      "retrieved_doc_ids": [
+        "escalation-sla",
+        "staff-notes-internal",
+        "clinic-policy"
+      ]
+    },
+    {
+      "id": "case_fasting_lipid",
+      "patient_id": "pat_004",
+      "query": "How long do I need to fast for a Lipid Profile?",
+      "predicted_intent": "test_prep",
+      "predicted_safety_level": null,
+      "retrieved_doc_ids": [
+        "test-prep-fasting",
+        "test-prep-fasting",
+        "staff-notes-internal"
+      ]
+    },
+    {
+      "id": "case_plan_coverage_v2",
+      "patient_id": "pat_002",
+      "query": "What is covered under the current care plan for lab tests and specialists?",
+      "predicted_intent": "plan_coverage",
+      "predicted_safety_level": null,
+      "retrieved_doc_ids": [
+        "plan-coverage",
+        "plan-coverage",
+        "department-directory"
+      ]
+    }
+  ]
+}

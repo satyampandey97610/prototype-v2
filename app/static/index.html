@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MicroHeal Care Concierge</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; margin: 24px; max-width: 920px; background: #f8fafc; color: #0f172a; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; align-items: center; }
+    select, input, button { padding: 8px 12px; border-radius: 6px; border: 1px solid #cbd5e1; font-size: 14px; }
+    button { background: #0f172a; color: #fff; cursor: pointer; }
+    button.secondary { background: #e2e8f0; color: #0f172a; }
+    #chat-box { background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px; min-height: 260px; max-height: 420px; overflow-y: auto; margin-bottom: 12px; }
+    .msg { margin-bottom: 12px; padding: 10px 12px; border-radius: 6px; white-space: pre-wrap; }
+    .user { background: #eff6ff; border-left: 4px solid #2563eb; }
+    .assistant { background: #f1f5f9; border-left: 4px solid #0f766e; }
+    .meta { font-size: 12px; color: #475569; margin-top: 4px; }
+    #timeline { background: #0f172a; color: #e2e8f0; padding: 12px; border-radius: 8px; font-family: monospace; font-size: 12px; max-height: 200px; overflow-y: auto; }
+  </style>
+</head>
+<body>
+  <h2>MicroHeal Care Concierge</h2>
+
+  <div class="row">
+    <label>Patient:
+      <select id="patient-select">
+        <option value="pat_003">pat_003 — Priya Nair (Shivalik Greens)</option>
+        <option value="pat_010">pat_010 — Suresh Yadav (Lotus Tower)</option>
+        <option value="pat_001">pat_001 — Ananya Sharma (Shivalik Greens)</option>
+        <option value="pat_016">pat_016 — Sanjay Bhatia (Royal Palms)</option>
+      </select>
+    </label>
+    <label>Thread ID:
+      <input id="thread-id" type="text" value="thread_demo_1" />
+    </label>
+    <button class="secondary" onclick="reloadHistory()">Reload History</button>
+    <button class="secondary" onclick="retryLastUuid()">Retry Last UUID</button>
+  </div>
+
+  <div id="chat-box"></div>
+
+  <div class="row">
+    <input id="message-input" type="text" style="flex: 1;" placeholder="Ask about Sunday wellness hours, test fasting, coverage, or book a slot..." />
+    <button onclick="sendMessage()">Send</button>
+  </div>
+
+  <h4>Tool-Call & Event Timeline</h4>
+  <div id="timeline"></div>
+
+  <script>
+    let lastRequestId = null;
+    let lastPayload = null;
+
+    function appendMsg(role, content, meta = "") {
+      const box = document.getElementById("chat-box");
+      const div = document.createElement("div");
+      div.className = `msg ${role}`;
+      div.innerHTML = `<div><strong>${role.toUpperCase()}</strong>: ${content}</div>${meta ? `<div class="meta">${meta}</div>` : ""}`;
+      box.appendChild(div);
+      box.scrollTop = box.scrollHeight;
+    }
+
+    function logTimeline(entry) {
+      const tl = document.getElementById("timeline");
+      tl.textContent += (typeof entry === "string" ? entry : JSON.stringify(entry)) + "\n";
+      tl.scrollTop = tl.scrollHeight;
+    }
+
+    function newUuid() {
+      return (crypto.randomUUID ? crypto.randomUUID() : "req_" + Date.now() + "_" + Math.random().toString(16).slice(2));
+    }
+
+    async function sendMessage(overrideReqId = null, overridePayload = null) {
+      const input = document.getElementById("message-input");
+      const message = overridePayload ? overridePayload.message : input.value.trim();
+      if (!message) return;
+
+      const patient_id = overridePayload ? overridePayload.patient_id : document.getElementById("patient-select").value;
+      const thread_id = overridePayload ? overridePayload.thread_id : document.getElementById("thread-id").value.trim();
+      const request_id = overrideReqId || newUuid();
+
+      lastRequestId = request_id;
+      lastPayload = { patient_id, thread_id, message };
+
+      if (!overridePayload) {
+        appendMsg("user", message, `request_id=${request_id}`);
+        input.value = "";
+      } else {
+        appendMsg("user", `${message} (Retry)`, `request_id=${request_id}`);
+      }
+
+      const res = await fetch("/v1/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ thread_id, patient_id, message, request_id })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        appendMsg("assistant", `Error: ${JSON.stringify(data)}`);
+        return;
+      }
+      const bookingInfo = data.booking ? ` | Booking: ${data.booking.booking_id}` : "";
+      appendMsg("assistant", data.reply, `request_id=${data.request_id}${bookingInfo}`);
+      for (const tc of (data.tool_calls || [])) {
+        logTimeline(tc);
+      }
+    }
+
+    async function retryLastUuid() {
+      if (!lastRequestId || !lastPayload) {
+        logTimeline("No previous request_id to retry.");
+        return;
+      }
+      await sendMessage(lastRequestId, lastPayload);
+    }
+
+    async function reloadHistory() {
+      const thread_id = document.getElementById("thread-id").value.trim();
+      const res = await fetch(`/v1/threads/${encodeURIComponent(thread_id)}`);
+      const data = await res.json();
+      if (!res.ok) {
+        logTimeline(`Reload failed: ${JSON.stringify(data)}`);
+        return;
+      }
+      const box = document.getElementById("chat-box");
+      box.innerHTML = "";
+      document.getElementById("timeline").textContent = "";
+      for (const m of (data.messages || [])) {
+        const metaParts = [];
+        if (m.metadata && m.metadata.request_id) metaParts.push(`request_id=${m.metadata.request_id}`);
+        if (m.metadata && m.metadata.booking && m.metadata.booking.booking_id) {
+          metaParts.push(`Booking: ${m.metadata.booking.booking_id}`);
+        }
+        appendMsg(m.role, m.content, metaParts.join(" | "));
+        if (m.metadata && Array.isArray(m.metadata.tool_calls)) {
+          for (const tc of m.metadata.tool_calls) {
+            logTimeline(tc);
+          }
+        }
+      }
+      logTimeline(`Restored thread ${thread_id} (${(data.messages || []).length} messages).`);
+    }
+
+    document.getElementById("message-input").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") sendMessage();
+    });
+  </script>
+</body>
+</html>
