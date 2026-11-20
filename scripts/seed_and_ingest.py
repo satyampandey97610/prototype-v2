@@ -8,14 +8,14 @@ from pathlib import Path
 from sqlalchemy import select
 
 from app.db import AsyncSessionLocal
-from app.models import Clinician, CorpusChunk, Patient, Society
+from app.models import Clinician, DocChunk, Document, Patient, Society
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 SEED_DIR = ROOT_DIR / "data" / "seed"
 CORPUS_DIR = ROOT_DIR / "data" / "corpus"
 
 
-def parse_frontmatter_and_sections(md_text: str, doc_id: str) -> list[dict]:
+def parse_frontmatter_and_sections(md_text: str, doc_id: str) -> tuple[dict, list[dict]]:
     meta: dict = {
         "doc_id": doc_id,
         "title": doc_id,
@@ -45,10 +45,12 @@ def parse_frontmatter_and_sections(md_text: str, doc_id: str) -> list[dict]:
 
     parts = re.split(r"(?m)^(#{1,3}\s+.+)$", body.strip())
     chunks: list[dict] = []
-    current_heading = meta["title"]
+    heading_stack: list[tuple[int, str]] = []
+    current_section = meta["title"]
+    current_heading_path = meta["title"]
     buffer: list[str] = []
 
-    def flush_chunk(idx: int, heading: str, content: str) -> dict | None:
+    def flush_chunk(idx: int, section: str, heading_path: str, content: str) -> dict | None:
         cleaned = content.strip()
         if not cleaned:
             return None
@@ -56,7 +58,8 @@ def parse_frontmatter_and_sections(md_text: str, doc_id: str) -> list[dict]:
             "chunk_id": f"{meta['doc_id']}#chunk-{idx}",
             "doc_id": meta["doc_id"],
             "title": meta["title"],
-            "section": heading.lstrip("#").strip(),
+            "section": section,
+            "heading_path": heading_path,
             "applies_to": meta["applies_to"],
             "version": meta["version"],
             "effective_from": meta["effective_from"],
@@ -69,21 +72,30 @@ def parse_frontmatter_and_sections(md_text: str, doc_id: str) -> list[dict]:
         stripped = part.strip()
         if not stripped:
             continue
-        if re.match(r"^#{1,3}\s+", stripped):
-            flushed = flush_chunk(idx, current_heading, "\n".join(buffer))
+        h_match = re.match(r"^(#{1,3})\s+(.+)$", stripped)
+        if h_match:
+            flushed = flush_chunk(idx, current_section, current_heading_path, "\n".join(buffer))
             if flushed:
                 chunks.append(flushed)
                 idx += 1
-            current_heading = stripped
+            level = len(h_match.group(1))
+            heading_text = h_match.group(2).strip()
+            while heading_stack and heading_stack[-1][0] >= level:
+                heading_stack.pop()
+            heading_stack.append((level, heading_text))
+            current_section = heading_text
+            if heading_stack[0][1].lower() == meta["title"].lower():
+                current_heading_path = " > ".join(h for _, h in heading_stack)
+            else:
+                current_heading_path = f"{meta['title']} > " + " > ".join(h for _, h in heading_stack)
             buffer = [stripped]
         else:
             buffer.append(stripped)
 
-    flushed = flush_chunk(idx, current_heading, "\n".join(buffer))
+    flushed = flush_chunk(idx, current_section, current_heading_path, "\n".join(buffer))
     if flushed:
         chunks.append(flushed)
 
-    # Deduplicate by chunk_id while preserving order (merge content if duplicate chunk_id occurs)
     deduped: dict[str, dict] = {}
     for ch in chunks:
         cid = ch["chunk_id"]
@@ -92,7 +104,7 @@ def parse_frontmatter_and_sections(md_text: str, doc_id: str) -> list[dict]:
         else:
             deduped[cid] = ch
 
-    return list(deduped.values())
+    return meta, list(deduped.values())
 
 
 def deterministic_embedding(text: str, dim: int = 1536) -> list[float]:
@@ -151,33 +163,79 @@ async def seed_all() -> None:
         await session.flush()
 
         if CORPUS_DIR.exists():
+            seen_doc_ids: set[str] = set()
             seen_chunk_ids: set[str] = set()
             for md_file in sorted(CORPUS_DIR.glob("*.md")):
-                doc_id = md_file.stem
+                file_stem = md_file.stem
                 raw_text = md_file.read_text(encoding="utf-8")
-                for ch in parse_frontmatter_and_sections(raw_text, doc_id):
-                    if ch["chunk_id"] in seen_chunk_ids:
-                        continue
-                    seen_chunk_ids.add(ch["chunk_id"])
+                meta, chunks = parse_frontmatter_and_sections(raw_text, file_stem)
+                doc_id = meta.get("doc_id") or file_stem
 
-                    emb = deterministic_embedding(f"{ch['title']} {ch['section']} {ch['content']}")
+                if doc_id not in seen_doc_ids:
+                    seen_doc_ids.add(doc_id)
+                    existing_doc = await session.get(Document, doc_id)
+                    if existing_doc:
+                        existing_doc.title = meta["title"]
+                        existing_doc.applies_to = meta["applies_to"]
+                        existing_doc.version = meta["version"]
+                        existing_doc.effective_from = meta["effective_from"]
+                        existing_doc.superseded_by = meta["superseded_by"]
+                        existing_doc.content = raw_text
+                    else:
+                        session.add(
+                            Document(
+                                doc_id=doc_id,
+                                title=meta["title"],
+                                applies_to=meta["applies_to"],
+                                version=meta["version"],
+                                effective_from=meta["effective_from"],
+                                superseded_by=meta["superseded_by"],
+                                content=raw_text,
+                            )
+                        )
+                    await session.flush()
+                else:
+                    # If a later file (e.g., plan-coverage-v2.md) has a higher version for the same doc_id,
+                    # update the already-stashed or existing Document record.
+                    existing_doc = await session.get(Document, doc_id)
+                    if existing_doc and (meta.get("version") or 1) >= (existing_doc.version or 1):
+                        existing_doc.title = meta["title"]
+                        existing_doc.applies_to = meta["applies_to"]
+                        existing_doc.version = meta["version"]
+                        existing_doc.effective_from = meta["effective_from"]
+                        existing_doc.superseded_by = meta["superseded_by"]
+                        existing_doc.content = raw_text
+                        await session.flush()
+
+                for ch in chunks:
+                    ch_copy = dict(ch)
+                    ch_copy["doc_id"] = doc_id
+                    if ch_copy["chunk_id"] in seen_chunk_ids:
+                        continue
+                    seen_chunk_ids.add(ch_copy["chunk_id"])
+
+                    emb = deterministic_embedding(
+                        f"{ch_copy['title']} {ch_copy['heading_path']} {ch_copy['section']} {ch_copy['content']}"
+                    )
                     existing_chunk = (
-                        await session.execute(select(CorpusChunk).where(CorpusChunk.chunk_id == ch["chunk_id"]))
+                        await session.execute(select(DocChunk).where(DocChunk.chunk_id == ch_copy["chunk_id"]))
                     ).scalar_one_or_none()
                     if existing_chunk:
-                        existing_chunk.content = ch["content"]
-                        existing_chunk.section = ch["section"]
-                        existing_chunk.version = ch["version"]
-                        existing_chunk.superseded_by = ch["superseded_by"]
-                        existing_chunk.applies_to = ch["applies_to"]
+                        existing_chunk.doc_id = doc_id
+                        existing_chunk.content = ch_copy["content"]
+                        existing_chunk.section = ch_copy["section"]
+                        existing_chunk.heading_path = ch_copy["heading_path"]
+                        existing_chunk.version = ch_copy["version"]
+                        existing_chunk.superseded_by = ch_copy["superseded_by"]
+                        existing_chunk.applies_to = ch_copy["applies_to"]
                         existing_chunk.embedding = emb
                     else:
-                        payload = {k: v for k, v in ch.items() if hasattr(CorpusChunk, k)}
+                        payload = {k: v for k, v in ch_copy.items() if hasattr(DocChunk, k)}
                         payload["embedding"] = emb
-                        session.add(CorpusChunk(**payload))
+                        session.add(DocChunk(**payload))
 
         await session.commit()
-        print("Seeded societies, clinicians, patients, and corpus chunks successfully.")
+        print("Seeded societies, clinicians, patients, documents, and doc_chunks successfully.")
 
 
 if __name__ == "__main__":

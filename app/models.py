@@ -1,6 +1,17 @@
 from datetime import datetime, timezone
 from typing import Any
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, orm
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from pgvector.sqlalchemy import Vector
 
@@ -33,7 +44,7 @@ class Clinician(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     title: Mapped[str] = mapped_column(String(200), nullable=False)
-    service: Mapped[str] = mapped_column(String(64), nullable=False)
+    service: Mapped[str] = mapped_column(String(64), nullable=False)  # DOCTOR | LAB
     subtypes: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     hospital: Mapped[str] = mapped_column(String(200), nullable=False)
     slot_minutes: Mapped[int] = mapped_column(Integer, default=20, nullable=False)
@@ -55,42 +66,52 @@ class Patient(Base):
     society: Mapped["Society"] = relationship("Society", back_populates="patients")
 
 
-class CorpusChunk(Base):
-    __tablename__ = "corpus_chunks"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    chunk_id: Mapped[str] = mapped_column(String(200), unique=True, nullable=False, index=True)
-    doc_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
-    title: Mapped[str] = mapped_column(String(255), nullable=False)
-    section: Mapped[str] = mapped_column(String(255), default="", nullable=False)
-    applies_to: Mapped[str] = mapped_column(String(128), default="all", nullable=False, index=True)
-    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
-    effective_from: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    superseded_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    content: Mapped[str] = mapped_column(Text, nullable=False)
-    embedding: Mapped[list[float] | None] = mapped_column(Vector(1536), nullable=True)
-
-
-class Booking(Base):
-    __tablename__ = "bookings"
+class ServiceRequest(Base):
+    __tablename__ = "service_requests"
     __table_args__ = (
-        UniqueConstraint("request_id", name="uq_bookings_request_id"),
+        UniqueConstraint("request_id", name="uq_service_requests_request_id"),
+        Index(
+            "uq_service_requests_active_clinician_slot",
+            "clinician_id",
+            "scheduled_for",
+            unique=True,
+            postgresql_where=text("status IN ('CONFIRMED', 'PENDING')"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     request_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
-    thread_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    thread_id: Mapped[str] = mapped_column(String(128), default="default_thread", nullable=False, index=True)
     patient_id: Mapped[str] = mapped_column(ForeignKey("patients.id"), nullable=False, index=True)
     society_id: Mapped[str] = mapped_column(ForeignKey("societies.id"), nullable=False, index=True)
     clinician_id: Mapped[str] = mapped_column(ForeignKey("clinicians.id"), nullable=False, index=True)
-    service: Mapped[str] = mapped_column(String(64), nullable=False)
-    subtype: Mapped[str] = mapped_column(String(128), nullable=False)
-    slot_start: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    service: Mapped[str] = mapped_column(String(64), nullable=False)  # DOCTOR | LAB
+    subtype: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    scheduled_for: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     status: Mapped[str] = mapped_column(String(32), default="CONFIRMED", nullable=False)
     notes: Mapped[str] = mapped_column(Text, default="", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
-    scheduled_for = orm.synonym("slot_start")
+
+class SymptomLog(Base):
+    __tablename__ = "symptom_logs"
+    __table_args__ = (
+        CheckConstraint("severity >= 1 AND severity <= 5", name="ck_symptom_logs_severity_1_5"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    thread_id: Mapped[str] = mapped_column(String(128), default="default_thread", nullable=False, index=True)
+    patient_id: Mapped[str] = mapped_column(ForeignKey("patients.id"), nullable=False, index=True)
+    society_id: Mapped[str] = mapped_column(ForeignKey("societies.id"), nullable=False, index=True)
+    symptom: Mapped[str] = mapped_column(Text, nullable=False)
+    severity: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    def __init__(self, **kwargs: Any):
+        if "request_id" not in kwargs or not kwargs["request_id"]:
+            kwargs["request_id"] = kwargs.get("thread_id") or "sym_req_default"
+        super().__init__(**kwargs)
 
 
 class Escalation(Base):
@@ -100,6 +121,7 @@ class Escalation(Base):
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    request_id: Mapped[str] = mapped_column(String(128), default="", nullable=False, index=True)
     thread_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     patient_id: Mapped[str] = mapped_column(ForeignKey("patients.id"), nullable=False, index=True)
     society_id: Mapped[str] = mapped_column(ForeignKey("societies.id"), nullable=False, index=True)
@@ -110,66 +132,47 @@ class Escalation(Base):
     emergency_contact: Mapped[str] = mapped_column(String(200), default="", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
-    def __init__(self, **kwargs: Any):
-        symptom = kwargs.pop("symptom", None)
-        severity = kwargs.pop("severity", None)
-        request_id = kwargs.pop("request_id", None)
 
-        if "thread_id" not in kwargs or kwargs["thread_id"] is None:
-            kwargs["thread_id"] = request_id or "symptom_log_thread"
-        if "level" not in kwargs or kwargs["level"] is None:
-            if severity is not None:
-                kwargs["level"] = severity
-            else:
-                kwargs["level"] = 3
-        if "sla_minutes" not in kwargs or kwargs["sla_minutes"] is None:
-            lvl = kwargs["level"]
-            kwargs["sla_minutes"] = 5 if lvl == 1 else (30 if lvl == 2 else 240)
-        if "trigger_message" not in kwargs or kwargs["trigger_message"] is None:
-            kwargs["trigger_message"] = symptom or ""
+class Document(Base):
+    __tablename__ = "documents"
 
-        super().__init__(**kwargs)
-        self.symptom = symptom
-        self.severity = severity if severity is not None else self.level
-        self.request_id = request_id
+    doc_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    applies_to: Mapped[str] = mapped_column(String(128), default="all", nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    effective_from: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    superseded_by: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
 
-
-class ConversationThread(Base):
-    __tablename__ = "conversation_threads"
-
-    thread_id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    patient_id: Mapped[str] = mapped_column(ForeignKey("patients.id"), nullable=False, index=True)
-    society_id: Mapped[str] = mapped_column(ForeignKey("societies.id"), nullable=False, index=True)
-    state_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
-    )
-
-    messages: Mapped[list["ThreadMessage"]] = relationship(
-        "ThreadMessage",
-        back_populates="thread",
+    chunks: Mapped[list["DocChunk"]] = relationship(
+        "DocChunk",
+        back_populates="document",
         cascade="all, delete-orphan",
-        order_by="ThreadMessage.id",
     )
 
 
-class ThreadMessage(Base):
-    __tablename__ = "thread_messages"
+class DocChunk(Base):
+    __tablename__ = "doc_chunks"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    thread_id: Mapped[str] = mapped_column(
-        ForeignKey("conversation_threads.thread_id", ondelete="CASCADE"),
+    chunk_id: Mapped[str] = mapped_column(String(200), unique=True, nullable=False, index=True)
+    doc_id: Mapped[str] = mapped_column(
+        ForeignKey("documents.doc_id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
-    role: Mapped[str] = mapped_column(String(32), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    section: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    heading_path: Mapped[str] = mapped_column(String(512), default="", nullable=False)
+    applies_to: Mapped[str] = mapped_column(String(128), default="all", nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    effective_from: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    superseded_by: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(1536), nullable=True)
 
-    thread: Mapped["ConversationThread"] = relationship("ConversationThread", back_populates="messages")
+    document: Mapped["Document"] = relationship("Document", back_populates="chunks")
 
 
-DocChunk = CorpusChunk
-ServiceRequest = Booking
-SymptomLog = Escalation
+Booking = ServiceRequest
+CorpusChunk = DocChunk

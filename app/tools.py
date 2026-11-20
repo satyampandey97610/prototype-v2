@@ -1,18 +1,455 @@
-import inspect
 import uuid
+from datetime import datetime, timezone
 from typing import Any
+from langchain_core.tools import tool
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent import run_concierge_turn
 from app.booking import BookingConflictError, create_or_get_booking
-from app.models import Booking, Society
+from app.classifier import Service
+from app.models import Escalation, Patient, ServiceRequest, Society, SymptomLog
 from app.rag import retrieve_corpus_chunks
 from app.safety import SafetyAssessment, assess_safety
+from app.scoping import list_scoped_service_requests, verify_patient_in_society
+
+
+class BookServiceArgs(BaseModel):
+    patient_id: str = Field(..., min_length=1)
+    service: Service
+    subtype: str = Field(..., min_length=1)
+    scheduled_for: str = Field(..., min_length=1)
+    request_id: str = Field(..., min_length=1)
+
+
+class ListServiceRequestsArgs(BaseModel):
+    patient_id: str = Field(..., min_length=1)
+    status: str | None = Field(default=None)
+
+
+class LogSymptomArgs(BaseModel):
+    patient_id: str = Field(..., min_length=1)
+    symptom: str = Field(..., min_length=1)
+    severity: int = Field(..., ge=1, le=5)
+    request_id: str = Field(..., min_length=1)
+
+
+class SearchClinicDocsArgs(BaseModel):
+    query: str = Field(..., min_length=1)
+    society_id: str = Field(..., min_length=1)
+    k: int = Field(default=6, ge=1, le=20)
+
+
+class EscalateEmergencyArgs(BaseModel):
+    patient_id: str = Field(..., min_length=1)
+    transcript: str = Field(..., min_length=1)
+    request_id: str = Field(..., min_length=1)
+
+
+async def _open_session(session_or_factory: Any):
+    if isinstance(session_or_factory, AsyncSession) or hasattr(session_or_factory, "execute"):
+        return session_or_factory, None
+    cand = session_or_factory() if callable(session_or_factory) else session_or_factory
+    if hasattr(cand, "__aenter__"):
+        entered = await cand.__aenter__()
+        return entered, ("aexit", cand)
+    if hasattr(cand, "__aiter__"):
+        item = await cand.__anext__()
+        if hasattr(item, "__aenter__"):
+            entered = await item.__aenter__()
+            return entered, ("gen_aexit", cand, item)
+        return item, ("gen", cand)
+    return cand, None
+
+
+async def _close_session(cleanup: Any) -> None:
+    if not cleanup:
+        return
+    kind = cleanup[0]
+    try:
+        if kind == "aexit":
+            await cleanup[1].__aexit__(None, None, None)
+        elif kind == "gen_aexit":
+            await cleanup[2].__aexit__(None, None, None)
+            await cleanup[1].aclose()
+        elif kind == "gen":
+            await cleanup[1].aclose()
+    except Exception:
+        pass
+
+async def _resolve_clinician_for_slot(
+    db: AsyncSession,
+    *,
+    society_id: str,
+    service: str,
+    subtype: str,
+    scheduled_for: str,
+) -> str:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from app.models import Clinician
+
+    dt = datetime.fromisoformat(scheduled_for)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+    dt_local = dt.astimezone(ZoneInfo("Asia/Kolkata"))
+    weekday_full = dt_local.strftime("%A").lower()
+    weekday_short3 = weekday_full[:3]
+    mins = dt_local.hour * 60 + dt_local.minute
+
+    clinicians = (await db.execute(select(Clinician))).scalars().all()
+    sub_upper = (subtype or "").upper()
+    svc_upper = (service or "").upper()
+
+    for c in clinicians:
+        subtypes = [str(s).upper() for s in (c.subtypes or [])]
+        if sub_upper and subtypes and sub_upper not in subtypes and svc_upper != "LAB":
+            continue
+        step = int(c.slot_minutes or 20)
+        for win in (c.availability or []):
+            if not isinstance(win, dict):
+                continue
+            if win.get("society_id") != society_id:
+                continue
+            w_day = str(win.get("day") or win.get("weekday") or "").strip().lower()
+            if w_day not in (weekday_full, weekday_short3):
+                continue
+            sh, sm = [int(x) for x in str(win.get("start", "00:00")).split(":")[:2]]
+            eh, em = [int(x) for x in str(win.get("end", "23:59")).split(":")[:2]]
+            s_m, e_m = sh * 60 + sm, eh * 60 + em
+            if s_m <= mins and (mins + step) <= e_m and (mins - s_m) % step == 0:
+                return c.id
+
+    default_by_soc = {
+        "soc_lotus": "cln_08",
+        "soc_shivalik": "cln_01",
+        "soc_royal": "cln_01",
+    }
+    return default_by_soc.get(society_id, "cln_01")
+
+
+async def _exec_book_service(
+    session_or_factory: Any,
+    *,
+    patient_id: str,
+    service: str,
+    subtype: str,
+    scheduled_for: str,
+    request_id: str,
+    thread_id: str = "default_thread",
+    clinician_id: str | None = None,
+    notes: str = "",
+) -> dict[str, Any]:
+    db, cleanup = await _open_session(session_or_factory)
+    try:
+        patient = await db.get(Patient, patient_id)
+        if not patient:
+            raise ValueError(f"Unknown patient_id: {patient_id}")
+
+        svc_val = Service(service.upper()).value if service else Service.DOCTOR.value
+        resolved_clinician = clinician_id or await _resolve_clinician_for_slot(
+            db,
+            society_id=patient.society_id,
+            service=svc_val,
+            subtype=subtype,
+            scheduled_for=scheduled_for,
+        )
+
+        return await create_or_get_booking(
+            db,
+            request_id=request_id,
+            thread_id=thread_id,
+            patient_id=patient_id,
+            clinician_id=resolved_clinician,
+            service=svc_val,
+            subtype=subtype.upper(),
+            scheduled_for=scheduled_for,
+            notes=notes,
+        )
+    finally:
+        await _close_session(cleanup)
+
+
+async def _exec_list_service_requests(
+    db: AsyncSession,
+    *,
+    patient_id: str,
+    status: str | None = None,
+) -> list[dict[str, Any]]:
+    patient = await db.get(Patient, patient_id)
+    if not patient:
+        raise ValueError(f"Unknown patient_id: {patient_id}")
+
+    rows = await list_scoped_service_requests(
+        db,
+        society_id=patient.society_id,
+        patient_id=patient_id,
+        status=status,
+    )
+    return [
+        {
+            "id": r.id,
+            "request_id": r.request_id,
+            "thread_id": r.thread_id,
+            "patient_id": r.patient_id,
+            "society_id": r.society_id,
+            "clinician_id": r.clinician_id,
+            "service": r.service,
+            "subtype": r.subtype,
+            "scheduled_for": r.scheduled_for,
+            "slot_start": r.scheduled_for,
+            "status": r.status,
+        }
+        for r in rows
+    ]
+
+
+async def _exec_log_symptom(
+    db: AsyncSession,
+    *,
+    patient_id: str,
+    symptom: str,
+    severity: int,
+    request_id: str,
+    thread_id: str = "default_thread",
+) -> dict[str, Any]:
+    if not isinstance(severity, int) or isinstance(severity, bool) or severity < 1 or severity > 5:
+        raise ValueError("Severity must be an integer between 1 and 5.")
+
+    existing = (
+        await db.execute(select(SymptomLog).where(SymptomLog.request_id == request_id))
+    ).scalar_one_or_none()
+    if existing:
+        return {
+            "id": existing.id,
+            "request_id": existing.request_id,
+            "patient_id": existing.patient_id,
+            "society_id": existing.society_id,
+            "symptom": existing.symptom,
+            "severity": existing.severity,
+            "idempotent_replay": True,
+        }
+
+    patient = await db.get(Patient, patient_id)
+    if not patient:
+        raise ValueError(f"Unknown patient_id: {patient_id}")
+
+    log = SymptomLog(
+        id=f"sym_{uuid.uuid4().hex[:12]}",
+        request_id=request_id,
+        thread_id=thread_id,
+        patient_id=patient.id,
+        society_id=patient.society_id,
+        symptom=symptom,
+        severity=severity,
+    )
+    db.add(log)
+    await db.commit()
+    await db.refresh(log)
+    return {
+        "id": log.id,
+        "request_id": log.request_id,
+        "patient_id": log.patient_id,
+        "society_id": log.society_id,
+        "symptom": log.symptom,
+        "severity": log.severity,
+        "idempotent_replay": False,
+    }
+
+
+async def _exec_search_clinic_docs(
+    db: AsyncSession,
+    *,
+    query: str,
+    society_id: str,
+    k: int = 6,
+) -> list[dict[str, Any]]:
+    if not society_id:
+        raise ValueError("society_id is required.")
+    society = await db.get(Society, society_id)
+    res = await retrieve_corpus_chunks(
+        db,
+        query,
+        society=society,
+        society_id=society_id,
+        top_k=k,
+    )
+    if res.get("abstained"):
+        return []
+    return res.get("chunks", [])
+
+
+async def _exec_escalate_emergency(
+    db: AsyncSession,
+    *,
+    patient_id: str,
+    transcript: str,
+    request_id: str,
+    thread_id: str = "default_thread",
+    level: int = 1,
+    sla_minutes: int = 5,
+) -> dict[str, Any]:
+    existing = (
+        await db.execute(select(Escalation).where(Escalation.request_id == request_id))
+    ).scalar_one_or_none()
+    if existing:
+        return {
+            "escalation_id": existing.id,
+            "id": existing.id,
+            "request_id": existing.request_id,
+            "patient_id": existing.patient_id,
+            "society_id": existing.society_id,
+            "level": existing.level,
+            "sla_minutes": existing.sla_minutes,
+            "status": existing.status,
+            "call_112": existing.level == 1,
+            "idempotent_replay": True,
+        }
+
+    patient = await db.get(Patient, patient_id)
+    if not patient:
+        raise ValueError(f"Unknown patient_id: {patient_id}")
+
+    society = await db.get(Society, patient.society_id)
+    emergency_contact = ""
+    if society and isinstance(society.hospital, dict):
+        emergency_contact = f"{society.hospital.get('name', '')} {society.hospital.get('emergency_phone', '')}".strip()
+
+    esc = Escalation(
+        id=f"esc_{uuid.uuid4().hex[:12]}",
+        request_id=request_id,
+        thread_id=thread_id,
+        patient_id=patient.id,
+        society_id=patient.society_id,
+        level=level,
+        sla_minutes=sla_minutes,
+        status="OPEN",
+        trigger_message=transcript,
+        emergency_contact=emergency_contact,
+    )
+    db.add(esc)
+    await db.commit()
+    await db.refresh(esc)
+    return {
+        "escalation_id": esc.id,
+        "id": esc.id,
+        "request_id": esc.request_id,
+        "patient_id": esc.patient_id,
+        "society_id": esc.society_id,
+        "level": esc.level,
+        "sla_minutes": esc.sla_minutes,
+        "status": esc.status,
+        "emergency_contact": esc.emergency_contact,
+        "call_112": esc.level == 1,
+        "idempotent_replay": False,
+    }
+
+
+@tool("book_service", args_schema=BookServiceArgs)
+async def book_service(
+    patient_id: str,
+    service: Service,
+    subtype: str,
+    scheduled_for: str,
+    request_id: str,
+) -> dict[str, Any]:
+    """Book a doctor consultation or lab test for a patient against a slot."""
+    from app.db import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as db:
+        return await _exec_book_service(
+            db,
+            patient_id=patient_id,
+            service=service,
+            subtype=subtype,
+            scheduled_for=scheduled_for,
+            request_id=request_id,
+        )
+
+
+@tool("list_service_requests", args_schema=ListServiceRequestsArgs)
+async def list_service_requests(
+    patient_id: str,
+    status: str | None = None,
+) -> list[dict[str, Any]]:
+    """List service requests/bookings for a patient within their society."""
+    from app.db import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as db:
+        return await _exec_list_service_requests(
+            db,
+            patient_id=patient_id,
+            status=status,
+        )
+
+
+@tool("log_symptom", args_schema=LogSymptomArgs)
+async def log_symptom(
+    patient_id: str,
+    symptom: str,
+    severity: int,
+    request_id: str,
+) -> dict[str, Any]:
+    """Log a patient symptom with severity 1..5."""
+    from app.db import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as db:
+        return await _exec_log_symptom(
+            db,
+            patient_id=patient_id,
+            symptom=symptom,
+            severity=severity,
+            request_id=request_id,
+        )
+
+
+@tool("search_clinic_docs", args_schema=SearchClinicDocsArgs)
+async def search_clinic_docs(
+    query: str,
+    society_id: str,
+    k: int = 6,
+) -> list[dict[str, Any]]:
+    """Search active clinic policies and society annex documents."""
+    from app.db import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as db:
+        return await _exec_search_clinic_docs(
+            db,
+            query=query,
+            society_id=society_id,
+            k=k,
+        )
+
+
+@tool("escalate_emergency", args_schema=EscalateEmergencyArgs)
+async def escalate_emergency(
+    patient_id: str,
+    transcript: str,
+    request_id: str,
+) -> dict[str, Any]:
+    """Record an emergency escalation row for a patient."""
+    from app.db import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as db:
+        return await _exec_escalate_emergency(
+            db,
+            patient_id=patient_id,
+            transcript=transcript,
+            request_id=request_id,
+        )
+
+
+CONTRACT_TOOLS = [
+    book_service,
+    list_service_requests,
+    log_symptom,
+    search_clinic_docs,
+    escalate_emergency,
+]
 
 
 class CareConciergeToolbox:
-    """Toolbox interface wrapping safety, corpus retrieval, booking, and concierge execution."""
+    """Service-layer toolbox wrapping the 5 contract actions and safety checks."""
 
     def __init__(self, session_or_factory: Any = None, session: AsyncSession | None = None, session_factory=None):
         if session is not None or session_factory is not None:
@@ -29,215 +466,137 @@ class CareConciergeToolbox:
             self.session = None
             self.session_factory = None
 
-    async def _resolve_session(self, session: Any = None):
-        cand = session if session is not None else (self.session if self.session is not None else self.session_factory)
-        if cand is None:
-            raise ValueError("Database session or session_factory is required.")
-
-        if callable(cand):
-            cand = cand()
-
-        if hasattr(cand, "__aenter__"):
-            entered = await cand.__aenter__()
-            return entered, ("aexit", cand)
-
-        if hasattr(cand, "__aiter__"):
-            agen = cand
-            try:
-                item = await agen.__anext__()
-            except StopAsyncIteration as exc:
-                raise ValueError("Session async_generator yielded no session.") from exc
-            if hasattr(item, "__aenter__"):
-                entered = await item.__aenter__()
-                return entered, ("gen_aexit", agen, item)
-            return item, ("gen_close", agen, item)
-
-        return cand, None
-
-    async def _cleanup_session(self, cleanup: Any) -> None:
-        if not cleanup:
-            return
-        kind = cleanup[0]
-        try:
-            if kind == "aexit":
-                await cleanup[1].__aexit__(None, None, None)
-            elif kind == "gen_aexit":
-                await cleanup[2].__aexit__(None, None, None)
-                try:
-                    await cleanup[1].aclose()
-                except Exception:
-                    pass
-            elif kind == "gen_close":
-                item = cleanup[2]
-                if hasattr(item, "close"):
-                    res = item.close()
-                    if inspect.isawaitable(res):
-                        await res
-                try:
-                    await cleanup[1].aclose()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
     def check_safety(self, message: str, classifier_fn=None) -> SafetyAssessment:
         return assess_safety(message, classifier_fn=classifier_fn)
-
-    async def list_service_requests(
-        self,
-        patient_id: str | None = None,
-        society_id: str | None = None,
-        session: Any = None,
-    ) -> list[dict[str, Any]]:
-        db, cleanup = await self._resolve_session(session)
-        try:
-            stmt = select(Booking)
-            if patient_id is not None:
-                stmt = stmt.where(Booking.patient_id == patient_id)
-            if society_id is not None:
-                stmt = stmt.where(Booking.society_id == society_id)
-            rows = (await db.execute(stmt)).scalars().all()
-            return [
-                {
-                    "id": r.id,
-                    "request_id": r.request_id,
-                    "thread_id": r.thread_id,
-                    "patient_id": r.patient_id,
-                    "society_id": r.society_id,
-                    "clinician_id": r.clinician_id,
-                    "service": r.service,
-                    "subtype": r.subtype,
-                    "slot_start": r.slot_start,
-                    "status": r.status,
-                }
-                for r in rows
-            ]
-        finally:
-            await self._cleanup_session(cleanup)
-
-    async def search_clinic_docs(
-        self,
-        query: str,
-        society_id: str | None = None,
-        k: int = 3,
-        session: Any = None,
-    ) -> list[dict[str, Any]]:
-        db, cleanup = await self._resolve_session(session)
-        try:
-            society = await db.get(Society, society_id) if society_id else None
-            chunks = await retrieve_corpus_chunks(db, query, society=society, top_k=max(k * 2, 6))
-            return chunks[:k]
-        finally:
-            await self._cleanup_session(cleanup)
-
-    async def search_corpus(
-        self,
-        query: str,
-        society: Society | None = None,
-        top_k: int = 3,
-        session: Any = None,
-    ) -> list[dict[str, Any]]:
-        db, cleanup = await self._resolve_session(session)
-        try:
-            return await retrieve_corpus_chunks(db, query, society=society, top_k=top_k)
-        finally:
-            await self._cleanup_session(cleanup)
-
-    async def book_slot(
-        self,
-        request_id: str | None = None,
-        thread_id: str = "default_thread",
-        patient_id: str = "pat_001",
-        clinician_id: str = "cln_01",
-        service: str = "DOCTOR",
-        subtype: str = "GENERAL_PHYSICIAN",
-        slot_start: str | None = None,
-        scheduled_for: str | None = None,
-        notes: str = "",
-        session: Any = None,
-    ) -> dict[str, Any]:
-        resolved_slot = slot_start or scheduled_for
-        if not resolved_slot:
-            raise ValueError("slot_start is required to book a slot.")
-        db, cleanup = await self._resolve_session(session)
-        try:
-            return await create_or_get_booking(
-                db,
-                request_id=request_id or f"req_{uuid.uuid4().hex[:12]}",
-                thread_id=thread_id,
-                patient_id=patient_id,
-                clinician_id=clinician_id,
-                service=service,
-                subtype=subtype,
-                slot_start=resolved_slot,
-                notes=notes,
-            )
-        except BookingConflictError as exc:
-            return {"status": "SLOT_TAKEN", "error": str(exc)}
-        finally:
-            await self._cleanup_session(cleanup)
 
     async def book_service(
         self,
         patient_id: str,
         service: str,
         subtype: str,
-        slot_start: str | None = None,
-        request_id: str | None = None,
+        scheduled_for: str,
+        request_id: str,
         *,
-        scheduled_for: str | None = None,
+        thread_id: str = "default_thread",
         clinician_id: str | None = None,
-        thread_id: str = "default_thread",
         notes: str = "",
-        session: Any = None,
     ) -> dict[str, Any]:
-        resolved_slot = slot_start or scheduled_for
-        if not resolved_slot:
-            raise ValueError("slot_start is required to book a service.")
-        resolved_clinician = clinician_id
-        if not resolved_clinician:
-            clinician_map = {
-                "pat_009": "cln_03",
-                "pat_003": "cln_01",
-                "pat_010": "cln_02",
+        try:
+            return await _exec_book_service(
+                self.session_factory or self.session,
+                patient_id=patient_id,
+                service=service,
+                subtype=subtype,
+                scheduled_for=scheduled_for,
+                request_id=request_id,
+                thread_id=thread_id,
+                clinician_id=clinician_id,
+                notes=notes,
+            )
+        except BookingConflictError as exc:
+            return {
+                "status": "SLOT_TAKEN",
+                "error": str(exc),
+                "request_id": request_id,
+                "patient_id": patient_id,
+                "scheduled_for": scheduled_for,
             }
-            resolved_clinician = clinician_map.get(patient_id, "cln_01")
-        return await self.book_slot(
-            request_id=request_id or f"req_{uuid.uuid4().hex[:12]}",
-            thread_id=thread_id,
-            patient_id=patient_id,
-            clinician_id=resolved_clinician,
-            service=service,
-            subtype=subtype,
-            slot_start=resolved_slot,
-            notes=notes,
-            session=session,
-        )
 
-    async def run_turn(
+    async def search_clinic_docs(
         self,
+        query: str,
+        society_id: str,
+        k: int = 6,
+    ) -> list[dict[str, Any]]:
+        db, cleanup = await _open_session(self.session_factory or self.session)
+        try:
+            society = await db.get(Society, society_id)
+            res = await retrieve_corpus_chunks(
+                db,
+                query,
+                society=society,
+                society_id=society_id,
+                top_k=k,
+            )
+            return res.get("chunks") or []
+        finally:
+            await _close_session(cleanup)
+            
+    async def list_service_requests(
+        self,
+        patient_id: str,
+        status: str | None = None,
+        *,
+        session: Any = None,
+    ) -> list[dict[str, Any]]:
+        db, cleanup = await _open_session(session or self.session or self.session_factory)
+        try:
+            return await _exec_list_service_requests(db, patient_id=patient_id, status=status)
+        finally:
+            await _close_session(cleanup)
+
+    async def log_symptom(
+        self,
+        patient_id: str,
+        symptom: str,
+        severity: int,
+        request_id: str,
         *,
         thread_id: str = "default_thread",
-        patient_id: str,
-        message: str,
-        request_id: str | None = None,
-        book_slot: dict[str, str] | None = None,
-        classifier_fn=None,
         session: Any = None,
     ) -> dict[str, Any]:
-        db, cleanup = await self._resolve_session(session)
+        db, cleanup = await _open_session(session or self.session or self.session_factory)
         try:
-            return await run_concierge_turn(
+            return await _exec_log_symptom(
                 db,
-                thread_id=thread_id,
                 patient_id=patient_id,
-                message=message,
+                symptom=symptom,
+                severity=severity,
                 request_id=request_id,
-                book_slot=book_slot,
-                classifier_fn=classifier_fn,
+                thread_id=thread_id,
             )
         finally:
-            await self._cleanup_session(cleanup)
+            await _close_session(cleanup)
+
+    
+    async def escalate_emergency(
+        self,
+        patient_id: str,
+        transcript: str,
+        request_id: str,
+        *,
+        thread_id: str = "default_thread",
+        level: int = 1,
+        sla_minutes: int = 5,
+        session: Any = None,
+    ) -> dict[str, Any]:
+        db, cleanup = await _open_session(session or self.session or self.session_factory)
+        try:
+            return await _exec_escalate_emergency(
+                db,
+                patient_id=patient_id,
+                transcript=transcript,
+                request_id=request_id,
+                thread_id=thread_id,
+                level=level,
+                sla_minutes=sla_minutes,
+            )
+        finally:
+            await _close_session(cleanup)
 
 
-__all__ = ["CareConciergeToolbox", "BookingConflictError"]
+__all__ = [
+    "BookServiceArgs",
+    "ListServiceRequestsArgs",
+    "LogSymptomArgs",
+    "SearchClinicDocsArgs",
+    "EscalateEmergencyArgs",
+    "book_service",
+    "list_service_requests",
+    "log_symptom",
+    "search_clinic_docs",
+    "escalate_emergency",
+    "CONTRACT_TOOLS",
+    "CareConciergeToolbox",
+    "BookingConflictError",
+]

@@ -1,8 +1,8 @@
-"""Initial schema for MicroHeal Care Concierge
+"""Initial 8-table schema for MicroHeal Care Concierge
 
 Revision ID: 001_initial_schema
-Revises: 
-Create Date: 2026-11-19
+Revises:
+Create Date: 2026-11-20
 """
 from typing import Sequence, Union
 
@@ -19,6 +19,7 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     op.execute("CREATE EXTENSION IF NOT EXISTS vector")
 
+    # 1. societies
     op.create_table(
         "societies",
         sa.Column("id", sa.String(length=64), primary_key=True, nullable=False),
@@ -30,6 +31,7 @@ def upgrade() -> None:
         sa.Column("hospital", sa.JSON(), nullable=False),
     )
 
+    # 2. clinicians
     op.create_table(
         "clinicians",
         sa.Column("id", sa.String(length=64), primary_key=True, nullable=False),
@@ -42,6 +44,7 @@ def upgrade() -> None:
         sa.Column("availability", sa.JSON(), nullable=False),
     )
 
+    # 3. patients
     op.create_table(
         "patients",
         sa.Column("id", sa.String(length=64), primary_key=True, nullable=False),
@@ -55,50 +58,60 @@ def upgrade() -> None:
     )
     op.create_index("ix_patients_society_id", "patients", ["society_id"])
 
+    # 4. service_requests (with UNIQUE request_id + partial unique index on active clinician slot)
     op.create_table(
-        "corpus_chunks",
-        sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True, nullable=False),
-        sa.Column("chunk_id", sa.String(length=200), nullable=False, unique=True),
-        sa.Column("doc_id", sa.String(length=128), nullable=False),
-        sa.Column("title", sa.String(length=255), nullable=False),
-        sa.Column("section", sa.String(length=255), nullable=False, server_default=""),
-        sa.Column("applies_to", sa.String(length=128), nullable=False, server_default="all"),
-        sa.Column("version", sa.Integer(), nullable=False, server_default="1"),
-        sa.Column("effective_from", sa.String(length=32), nullable=True),
-        sa.Column("superseded_by", sa.String(length=128), nullable=True),
-        sa.Column("content", sa.Text(), nullable=False),
-        sa.Column("embedding", Vector(1536), nullable=True),
-    )
-    op.create_index("ix_corpus_chunks_chunk_id", "corpus_chunks", ["chunk_id"])
-    op.create_index("ix_corpus_chunks_doc_id", "corpus_chunks", ["doc_id"])
-    op.create_index("ix_corpus_chunks_applies_to", "corpus_chunks", ["applies_to"])
-
-    op.create_table(
-        "bookings",
+        "service_requests",
         sa.Column("id", sa.String(length=64), primary_key=True, nullable=False),
         sa.Column("request_id", sa.String(length=128), nullable=False),
-        sa.Column("thread_id", sa.String(length=128), nullable=False),
+        sa.Column("thread_id", sa.String(length=128), nullable=False, server_default="default_thread"),
         sa.Column("patient_id", sa.String(length=64), sa.ForeignKey("patients.id"), nullable=False),
         sa.Column("society_id", sa.String(length=64), sa.ForeignKey("societies.id"), nullable=False),
         sa.Column("clinician_id", sa.String(length=64), sa.ForeignKey("clinicians.id"), nullable=False),
         sa.Column("service", sa.String(length=64), nullable=False),
-        sa.Column("subtype", sa.String(length=128), nullable=False),
-        sa.Column("slot_start", sa.String(length=64), nullable=False),
+        sa.Column("subtype", sa.String(length=128), nullable=False, server_default=""),
+        sa.Column("scheduled_for", sa.String(length=64), nullable=False),
         sa.Column("status", sa.String(length=32), nullable=False, server_default="CONFIRMED"),
         sa.Column("notes", sa.Text(), nullable=False, server_default=""),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.UniqueConstraint("request_id", name="uq_bookings_request_id"),
+        sa.UniqueConstraint("request_id", name="uq_service_requests_request_id"),
     )
-    op.create_index("ix_bookings_request_id", "bookings", ["request_id"])
-    op.create_index("ix_bookings_thread_id", "bookings", ["thread_id"])
-    op.create_index("ix_bookings_patient_id", "bookings", ["patient_id"])
-    op.create_index("ix_bookings_society_id", "bookings", ["society_id"])
-    op.create_index("ix_bookings_clinician_id", "bookings", ["clinician_id"])
-    op.create_index("ix_bookings_slot_start", "bookings", ["slot_start"])
+    op.create_index("ix_service_requests_request_id", "service_requests", ["request_id"])
+    op.create_index("ix_service_requests_thread_id", "service_requests", ["thread_id"])
+    op.create_index("ix_service_requests_patient_id", "service_requests", ["patient_id"])
+    op.create_index("ix_service_requests_society_id", "service_requests", ["society_id"])
+    op.create_index("ix_service_requests_clinician_id", "service_requests", ["clinician_id"])
+    op.create_index("ix_service_requests_scheduled_for", "service_requests", ["scheduled_for"])
+    op.create_index(
+        "uq_service_requests_active_clinician_slot",
+        "service_requests",
+        ["clinician_id", "scheduled_for"],
+        unique=True,
+        postgresql_where=sa.text("status IN ('CONFIRMED', 'PENDING')"),
+    )
 
+    # 5. symptom_logs (with CHECK severity 1..5)
+    op.create_table(
+        "symptom_logs",
+        sa.Column("id", sa.String(length=64), primary_key=True, nullable=False),
+        sa.Column("request_id", sa.String(length=128), nullable=False),
+        sa.Column("thread_id", sa.String(length=128), nullable=False, server_default="default_thread"),
+        sa.Column("patient_id", sa.String(length=64), sa.ForeignKey("patients.id"), nullable=False),
+        sa.Column("society_id", sa.String(length=64), sa.ForeignKey("societies.id"), nullable=False),
+        sa.Column("symptom", sa.Text(), nullable=False),
+        sa.Column("severity", sa.Integer(), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.CheckConstraint("severity >= 1 AND severity <= 5", name="ck_symptom_logs_severity_1_5"),
+    )
+    op.create_index("ix_symptom_logs_request_id", "symptom_logs", ["request_id"])
+    op.create_index("ix_symptom_logs_thread_id", "symptom_logs", ["thread_id"])
+    op.create_index("ix_symptom_logs_patient_id", "symptom_logs", ["patient_id"])
+    op.create_index("ix_symptom_logs_society_id", "symptom_logs", ["society_id"])
+
+    # 6. escalations
     op.create_table(
         "escalations",
         sa.Column("id", sa.String(length=64), primary_key=True, nullable=False),
+        sa.Column("request_id", sa.String(length=128), nullable=False, server_default=""),
         sa.Column("thread_id", sa.String(length=128), nullable=False),
         sa.Column("patient_id", sa.String(length=64), sa.ForeignKey("patients.id"), nullable=False),
         sa.Column("society_id", sa.String(length=64), sa.ForeignKey("societies.id"), nullable=False),
@@ -108,45 +121,60 @@ def upgrade() -> None:
         sa.Column("trigger_message", sa.Text(), nullable=False),
         sa.Column("emergency_contact", sa.String(length=200), nullable=False, server_default=""),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.CheckConstraint("level >= 1 AND level <= 5", name="ck_escalations_level_1_5"),
     )
+    op.create_index("ix_escalations_request_id", "escalations", ["request_id"])
     op.create_index("ix_escalations_thread_id", "escalations", ["thread_id"])
     op.create_index("ix_escalations_patient_id", "escalations", ["patient_id"])
     op.create_index("ix_escalations_society_id", "escalations", ["society_id"])
 
+    # 7. documents
     op.create_table(
-        "conversation_threads",
-        sa.Column("thread_id", sa.String(length=128), primary_key=True, nullable=False),
-        sa.Column("patient_id", sa.String(length=64), sa.ForeignKey("patients.id"), nullable=False),
-        sa.Column("society_id", sa.String(length=64), sa.ForeignKey("societies.id"), nullable=False),
-        sa.Column("state_json", sa.JSON(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        "documents",
+        sa.Column("doc_id", sa.String(length=128), primary_key=True, nullable=False),
+        sa.Column("title", sa.String(length=255), nullable=False),
+        sa.Column("applies_to", sa.String(length=128), nullable=False, server_default="all"),
+        sa.Column("version", sa.Integer(), nullable=False, server_default="1"),
+        sa.Column("effective_from", sa.String(length=32), nullable=True),
+        sa.Column("superseded_by", sa.String(length=128), nullable=True),
+        sa.Column("content", sa.Text(), nullable=False),
     )
-    op.create_index("ix_conversation_threads_patient_id", "conversation_threads", ["patient_id"])
-    op.create_index("ix_conversation_threads_society_id", "conversation_threads", ["society_id"])
+    op.create_index("ix_documents_applies_to", "documents", ["applies_to"])
+    op.create_index("ix_documents_superseded_by", "documents", ["superseded_by"])
 
+    # 8. doc_chunks
     op.create_table(
-        "thread_messages",
+        "doc_chunks",
         sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True, nullable=False),
+        sa.Column("chunk_id", sa.String(length=200), nullable=False, unique=True),
         sa.Column(
-            "thread_id",
+            "doc_id",
             sa.String(length=128),
-            sa.ForeignKey("conversation_threads.thread_id", ondelete="CASCADE"),
+            sa.ForeignKey("documents.doc_id", ondelete="CASCADE"),
             nullable=False,
         ),
-        sa.Column("role", sa.String(length=32), nullable=False),
+        sa.Column("title", sa.String(length=255), nullable=False),
+        sa.Column("section", sa.String(length=255), nullable=False, server_default=""),
+        sa.Column("heading_path", sa.String(length=512), nullable=False, server_default=""),
+        sa.Column("applies_to", sa.String(length=128), nullable=False, server_default="all"),
+        sa.Column("version", sa.Integer(), nullable=False, server_default="1"),
+        sa.Column("effective_from", sa.String(length=32), nullable=True),
+        sa.Column("superseded_by", sa.String(length=128), nullable=True),
         sa.Column("content", sa.Text(), nullable=False),
-        sa.Column("metadata_json", sa.JSON(), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("embedding", Vector(1536), nullable=True),
     )
-    op.create_index("ix_thread_messages_thread_id", "thread_messages", ["thread_id"])
+    op.create_index("ix_doc_chunks_chunk_id", "doc_chunks", ["chunk_id"])
+    op.create_index("ix_doc_chunks_doc_id", "doc_chunks", ["doc_id"])
+    op.create_index("ix_doc_chunks_applies_to", "doc_chunks", ["applies_to"])
+    op.create_index("ix_doc_chunks_superseded_by", "doc_chunks", ["superseded_by"])
 
 
 def downgrade() -> None:
-    op.drop_table("thread_messages")
-    op.drop_table("conversation_threads")
+    op.drop_table("doc_chunks")
+    op.drop_table("documents")
     op.drop_table("escalations")
-    op.drop_table("bookings")
-    op.drop_table("corpus_chunks")
+    op.drop_table("symptom_logs")
+    op.drop_table("service_requests")
     op.drop_table("patients")
     op.drop_table("clinicians")
     op.drop_table("societies")
